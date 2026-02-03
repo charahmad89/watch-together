@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState, ReactNode } from 'react';
+import { createContext, useContext, useEffect, useState, useRef, ReactNode, Dispatch, SetStateAction } from 'react';
 import { supabase } from '../lib/supabase';
 import type { Room, Participant, Reaction } from '../lib/supabase';
 import { socket } from '../lib/socket';
@@ -18,13 +18,16 @@ interface WatchPartyContextType {
   messages: Message[];
   currentUser: string | null;
   isHost: boolean;
-  createRoom: (name: string, movieUrl: string, movieTitle: string, userName: string) => Promise<string>;
+  kickUser: (participantId: string) => void;
+  endParty: () => void;
+  createRoom: (name: string, movieUrl: string, movieTitle: string, userName: string, subtitlesUrl?: string) => Promise<string>;
   joinRoom: (roomId: string, userName: string) => Promise<void>;
   leaveRoom: () => Promise<void>;
   updatePlayback: (currentTime: number, isPlaying: boolean) => Promise<void>;
   addReaction: (emoji: string, timestamp: number) => Promise<void>;
   sendMessage: (text: string, videoTimestamp: number) => void;
   setCurrentUser: (name: string) => void;
+  setMessages: Dispatch<SetStateAction<Message[]>>;
 }
 
 const WatchPartyContext = createContext<WatchPartyContextType | undefined>(undefined);
@@ -36,36 +39,100 @@ export function WatchPartyProvider({ children }: { children: ReactNode }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [participantId, setParticipantId] = useState<string | null>(null);
+  const [isHost, setIsHost] = useState(false);
+  const lastEmitTime = useRef<number>(0);
 
-  const isHost = room?.host_id === currentUser;
+  // Sync isHost with room creator initially, but allow socket update
+  useEffect(() => {
+    if (room?.host_id && currentUser) {
+      setIsHost(room.host_id === currentUser);
+    }
+  }, [room?.host_id, currentUser]);
 
   useEffect(() => {
     if (!room?.id || !currentUser) return;
 
     // Connect to Socket.IO
     socket.connect();
-    socket.emit('join-room', { 
+
+    // Generate or retrieve a stable user ID for this session
+    // This prevents "ghost users" when the socket reconnects (e.g. WiFi flicker)
+    let stableUserId = sessionStorage.getItem('watch_party_user_id');
+    if (!stableUserId) {
+        // Use auth ID if available (needs to be passed in, but for now we use random UUID for stability)
+        // If we had the real auth user ID here, we should use it.
+        // Since we don't have it easily accessible in this scope without prop drilling, 
+        // a session-based UUID is fine for preventing ghosts in the current session.
+        stableUserId = crypto.randomUUID();
+        sessionStorage.setItem('watch_party_user_id', stableUserId);
+    }
+
+    const joinPayload = { 
       roomId: room.id, 
-      user: { name: currentUser, id: participantId } 
+      user: { 
+        id: stableUserId, // Send stable ID
+        name: currentUser,
+        user_name: currentUser,
+        room_id: room.id,
+        is_online: true,
+        joined_at: new Date().toISOString()
+      } 
+    };
+
+    socket.emit('join-room', joinPayload);
+
+    // Re-join on reconnection
+    socket.on('connect', () => {
+        console.log('Socket reconnected, re-joining room...');
+        socket.emit('join-room', joinPayload);
     });
 
-    socket.on('participants-update', (updatedParticipants: any[]) => {
-      // Map socket participants to our Participant type if needed
-      // For now, we trust the structure or we might need to fetch from Supabase if we want full details
-      // But let's assume socket sends enough info.
-      // Actually, let's keep Supabase for participants list for now to avoid breaking changes, 
-      // but we could use socket for "online" status.
-      // The user wants "Sync resilience", so Supabase is good for initial load.
+    socket.on('participants-update', (data: any) => {
+      // Update participants list from server (Source of Truth for presence)
+      if (data.participants) {
+        setParticipants(data.participants);
+      }
+      
+      // Handle host update
+      if (data.hostId) {
+        if (socket.id === data.hostId) {
+          setIsHost(true);
+        } else {
+          setIsHost(false);
+        }
+      }
     });
+
+    socket.on('kicked', () => {
+      alert('You have been kicked from the room.');
+      leaveRoom();
+      window.location.href = '/';
+    });
+
+    socket.on('party-ended', () => {
+      alert('The host has ended the party.');
+      leaveRoom();
+      window.location.href = '/';
+    });
+
+    // We keep Supabase as the source of truth for initial loading, but Socket for live updates.
 
     socket.on('playback-update', (playbackState: { currentTime: number; isPlaying: boolean; timestamp: number }) => {
       setRoom((prev) => {
         if (!prev) return null;
+        
+        // FIX: Removed server-client clock diff calculation which caused major desync due to clock skew.
+        // Instead, we trust the host's timestamp and assume a small network latency buffer (150ms).
+        const NETWORK_LATENCY_BUFFER = 0.15;
+        const estimatedTime = playbackState.isPlaying 
+          ? playbackState.currentTime + NETWORK_LATENCY_BUFFER
+          : playbackState.currentTime;
+
         return {
           ...prev,
-          current_time: playbackState.currentTime,
+          current_time: estimatedTime,
           is_playing: playbackState.isPlaying,
-          updated_at: new Date(playbackState.timestamp).toISOString()
+          updated_at: new Date().toISOString() // Use local time for last update
         };
       });
     });
@@ -101,12 +168,17 @@ export function WatchPartyProvider({ children }: { children: ReactNode }) {
         'postgres_changes',
         { event: '*', schema: 'public', table: 'participants', filter: `room_id=eq.${room.id}` },
         async () => {
+          // We now rely on Socket.IO for the live participants list to handle disconnects/ghosts correctly.
+          // Supabase is used only for initial load or historical data.
+          // keeping this here just in case we want to merge, but for now we ignore it to prevent conflict.
+          /*
           const { data } = await supabase
             .from('participants')
             .select('*')
             .eq('room_id', room.id)
             .order('joined_at', { ascending: true });
           if (data) setParticipants(data);
+          */
         }
       )
       .subscribe();
@@ -122,6 +194,7 @@ export function WatchPartyProvider({ children }: { children: ReactNode }) {
 
     return () => {
       socket.off('participants-update');
+      socket.off('kicked');
       socket.off('playback-update');
       socket.off('new-reaction');
       socket.disconnect();
@@ -130,7 +203,19 @@ export function WatchPartyProvider({ children }: { children: ReactNode }) {
     };
   }, [room?.id, currentUser, participantId]);
 
-  const createRoom = async (name: string, movieUrl: string, movieTitle: string, userName: string) => {
+  const kickUser = (targetParticipantId: string) => {
+    if (room?.id) {
+      socket.emit('kick-user', { roomId: room.id, targetUserId: targetParticipantId });
+    }
+  };
+
+  const endParty = () => {
+    if (room?.id && isHost) {
+      socket.emit('end-party', { roomId: room.id });
+    }
+  };
+
+  const createRoom = async (name: string, movieUrl: string, movieTitle: string, userName: string, subtitlesUrl?: string) => {
     const { data, error } = await supabase
       .from('rooms')
       .insert({
@@ -138,6 +223,7 @@ export function WatchPartyProvider({ children }: { children: ReactNode }) {
         host_id: userName,
         movie_url: movieUrl,
         movie_title: movieTitle,
+        subtitles_url: subtitlesUrl,
       })
       .select()
       .single();
@@ -204,6 +290,13 @@ export function WatchPartyProvider({ children }: { children: ReactNode }) {
     // Optimistic update
     setRoom((prev) => prev ? { ...prev, playback_time: currentTime, is_playing: isPlaying } : null);
 
+    // Throttle socket emission to once per second unless play state changes
+    const now = Date.now();
+    if (isPlaying === room.is_playing && now - lastEmitTime.current < 1000) {
+      return;
+    }
+    lastEmitTime.current = now;
+
     // Emit to Socket.IO
     socket.emit('sync-playback', {
       roomId: room.id,
@@ -214,9 +307,6 @@ export function WatchPartyProvider({ children }: { children: ReactNode }) {
     });
 
     // Optionally persist to Supabase (debounced or on pause)
-    // For now, let's update Supabase every time to keep it in sync for late joiners
-    // but maybe we should debounce this in a real app.
-    // The previous code updated Supabase on every call.
     if (!isPlaying || Math.floor(currentTime) % 5 === 0) { // Update DB less frequently
         await supabase
         .from('rooms')
@@ -283,6 +373,8 @@ export function WatchPartyProvider({ children }: { children: ReactNode }) {
         addReaction,
         sendMessage,
         setCurrentUser,
+        setMessages,
+        kickUser,
       }}
     >
       {children}

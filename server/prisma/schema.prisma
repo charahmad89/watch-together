@@ -1,0 +1,58 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  password  String
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  purchases Purchase[]
+  hostedRooms Room[]
+}
+
+model Movie {
+  id          Int      @id @default(autoincrement())
+  title       String
+  description String
+  thumbnail   String
+  price       Float    
+  videoUrl    String?
+  subtitlesUrl String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  purchases   Purchase[]
+}
+
+model Purchase {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  movieId   Int
+  type      String   // "ONE_TIME" or "LIFETIME"
+  token     String   @unique
+  amount    Float
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id])
+  movie     Movie    @relation(fields: [movieId], references: [id])
+}
+
+model Room {
+  id          String   @id @default(uuid())
+  hostId      Int
+  host        User     @relation(fields: [hostId], references: [id])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  isPlaying   Boolean  @default(false)
+  currentTime Float    @default(0)
+  movieId     Int?
+}

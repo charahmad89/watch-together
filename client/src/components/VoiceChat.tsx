@@ -1,21 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { Mic, MicOff, Volume2 } from 'lucide-react';
 import { socket } from '../lib/socket';
-
-const ICE_SERVERS = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:global.stun.twilio.com:3478' }
-  ],
-};
+import SimplePeer from 'simple-peer';
 
 export function VoiceChat() {
   const [isMuted, setIsMuted] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
-  const [peers, setPeers] = useState<string[]>([]);
-  
+  const [peers, setPeers] = useState<{ peerId: string; peer: SimplePeer.Instance }[]>([]);
   const userStream = useRef<MediaStream | null>(null);
-  const peersRef = useRef<{ [key: string]: RTCPeerConnection }>({});
+  const peersRef = useRef<{ [key: string]: SimplePeer.Instance }>({});
 
   useEffect(() => {
     const initVoice = async () => {
@@ -24,51 +17,40 @@ export function VoiceChat() {
         userStream.current = stream;
         setIsConnected(true);
 
-        socket.on('existing-users', (users: any[]) => {
+        socket.on('existing-users', (users: { id: string }[]) => {
           users.forEach(user => {
             createPeer(user.id, socket.id!, stream);
           });
         });
 
-        socket.on('user-joined', (payload: { userId: string }) => {
-          // We wait for them to call us, or we call them?
-          // If we follow "New user calls existing", we just wait for offer.
-          // But to be robust, let's stick to "New user creates offers".
+        socket.on('signal', (payload: { sender: string; signal: SimplePeer.SignalData }) => {
+           const { sender, signal } = payload;
+           const peer = peersRef.current[sender];
+           
+           if (peer) {
+             peer.signal(signal);
+           } else {
+             // Incoming call (we are not the initiator)
+             addPeer(sender, socket.id!, signal, stream);
+           }
         });
-
-        socket.on('offer', async (payload) => {
-          const peer = addPeer(payload.callerId, stream);
-          await peer.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-          const answer = await peer.createAnswer();
-          await peer.setLocalDescription(answer);
-          
-          socket.emit('answer', {
-            target: payload.callerId,
-            callerId: socket.id,
-            sdp: answer
-          });
-        });
-
-        socket.on('answer', async (payload) => {
-          const peer = peersRef.current[payload.callerId];
-          if (peer) {
-            await peer.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-          }
-        });
-
-        socket.on('ice-candidate', async (payload) => {
-          const peer = peersRef.current[payload.callerId];
-          if (peer && payload.candidate) {
-            await peer.addIceCandidate(new RTCIceCandidate(payload.candidate));
-          }
-        });
+        
+        // Also handle the legacy/separate events if needed, but 'signal' covers it.
+        // But wait, the server emits 'participants-update' then 'existing-users'.
+        // If a new user joins, existing users get 'participants-update'.
+        // They need to know to initiate? 
+        // No, with the pattern "New user initiates to everyone", existing users just wait.
+        // My server sends 'existing-users' to the NEW user. So NEW user initiates.
+        // Existing users receive 'signal' (offer) and answer.
+        // So this logic holds.
 
         socket.on('user-left', (payload) => {
-            if (peersRef.current[payload.userId]) {
-                peersRef.current[payload.userId].close();
-                delete peersRef.current[payload.userId];
-                setPeers(prev => prev.filter(id => id !== payload.userId));
-            }
+           const peer = peersRef.current[payload.userId];
+           if (peer) {
+             peer.destroy();
+             delete peersRef.current[payload.userId];
+             setPeers(prev => prev.filter(p => p.peerId !== payload.userId));
+           }
         });
 
       } catch (err) {
@@ -80,103 +62,105 @@ export function VoiceChat() {
 
     return () => {
       userStream.current?.getTracks().forEach(track => track.stop());
-      Object.values(peersRef.current).forEach(peer => peer.close());
+      Object.values(peersRef.current).forEach(peer => peer.destroy());
       socket.off('existing-users');
-      socket.off('user-joined');
-      socket.off('offer');
-      socket.off('answer');
-      socket.off('ice-candidate');
+      socket.off('signal');
       socket.off('user-left');
     };
   }, []);
 
-  function createPeer(targetId: string, myId: string, stream: MediaStream) {
-    const peer = new RTCPeerConnection(ICE_SERVERS);
-    peersRef.current[targetId] = peer;
-    setPeers(prev => [...prev, targetId]);
-
-    stream.getTracks().forEach(track => peer.addTrack(track, stream));
-
-    peer.onicecandidate = (e) => {
-      if (e.candidate) {
-        socket.emit('ice-candidate', {
-          target: targetId,
-          callerId: myId,
-          candidate: e.candidate
-        });
-      }
-    };
-
-    peer.ontrack = (e) => {
-      const audio = new Audio();
-      audio.srcObject = e.streams[0];
-      audio.play();
-    };
-
-    peer.createOffer().then(offer => {
-      peer.setLocalDescription(offer);
-      socket.emit('offer', {
-        target: targetId,
-        callerId: myId,
-        sdp: offer
-      });
+  function createPeer(targetId: string, callerId: string, stream: MediaStream) {
+    const peer = new SimplePeer({
+      initiator: true,
+      trickle: false,
+      stream,
     });
 
-    return peer;
+    peer.on('signal', (signal) => {
+      socket.emit('signal', { target: targetId, signal, callerId });
+    });
+
+    peer.on('error', (err) => {
+        console.error('Peer error:', err);
+    });
+
+    peersRef.current[targetId] = peer;
+    setPeers(prev => [...prev, { peerId: targetId, peer }]);
   }
 
-  function addPeer(incomingUserId: string, stream: MediaStream) {
-    const peer = new RTCPeerConnection(ICE_SERVERS);
-    peersRef.current[incomingUserId] = peer;
-    setPeers(prev => [...prev, incomingUserId]);
+  function addPeer(incomingSignalId: string, callerId: string, incomingSignal: SimplePeer.SignalData, stream: MediaStream) {
+    const peer = new SimplePeer({
+      initiator: false,
+      trickle: false,
+      stream,
+    });
 
-    stream.getTracks().forEach(track => peer.addTrack(track, stream));
+    peer.on('signal', (signal) => {
+      socket.emit('signal', { target: incomingSignalId, signal, callerId });
+    });
+    
+    peer.on('error', (err) => {
+        console.error('Peer error:', err);
+    });
 
-    peer.onicecandidate = (e) => {
-      if (e.candidate) {
-        socket.emit('ice-candidate', {
-          target: incomingUserId,
-          callerId: socket.id,
-          candidate: e.candidate
-        });
-      }
-    };
+    peer.signal(incomingSignal);
 
-    peer.ontrack = (e) => {
-      const audio = new Audio();
-      audio.srcObject = e.streams[0];
-      audio.play();
-    };
-
-    return peer;
+    peersRef.current[incomingSignalId] = peer;
+    setPeers(prev => [...prev, { peerId: incomingSignalId, peer }]);
   }
 
   const toggleMute = () => {
     if (userStream.current) {
       userStream.current.getAudioTracks().forEach(track => {
-        track.enabled = !isMuted;
+        track.enabled = !track.enabled;
       });
       setIsMuted(!isMuted);
     }
   };
 
-  if (!isConnected) return null;
-
   return (
-    <div className="bg-gray-800 rounded-xl p-3 flex items-center gap-3">
-        <div className="bg-green-500/20 p-2 rounded-full">
-            <Volume2 size={20} className="text-green-500" />
+    <div className="bg-primary/10 rounded-xl p-4 border border-primary/20 flex items-center justify-between mb-2">
+      <div className="flex items-center gap-3">
+        <div className={`p-2 rounded-full ${isConnected ? 'bg-green-500/20 text-green-500' : 'bg-red-500/20 text-red-500'}`}>
+           <Volume2 size={20} />
         </div>
-        <div className="flex-1">
-            <p className="text-white text-sm font-medium">Voice Chat</p>
-            <p className="text-gray-400 text-xs">{peers.length} connected</p>
+        <div>
+          <h3 className="text-white font-medium text-sm">Voice Chat</h3>
+          <p className="text-gray-400 text-xs">
+            {isConnected ? `${peers.length + 1} connected` : 'Connecting...'}
+          </p>
         </div>
-        <button 
-            onClick={toggleMute}
-            className={`p-2 rounded-lg transition-colors ${isMuted ? 'bg-red-500/20 text-red-400' : 'bg-gray-700 text-white hover:bg-gray-600'}`}
-        >
-            {isMuted ? <MicOff size={18} /> : <Mic size={18} />}
-        </button>
+      </div>
+      
+      <button
+        onClick={toggleMute}
+        className={`p-2 rounded-lg transition-colors ${
+          isMuted 
+            ? 'bg-red-500/20 text-red-500 hover:bg-red-500/30' 
+            : 'bg-white/10 text-white hover:bg-white/20'
+        }`}
+      >
+        {isMuted ? <MicOff size={18} /> : <Mic size={18} />}
+      </button>
+
+      {/* Render Audio elements for peers */}
+      {peers.map((peerObj) => (
+        <Audio key={peerObj.peerId} peer={peerObj.peer} />
+      ))}
     </div>
   );
 }
+
+const Audio = ({ peer }: { peer: SimplePeer.Instance }) => {
+  const ref = useRef<HTMLAudioElement>(null);
+  
+  useEffect(() => {
+    peer.on('stream', stream => {
+        if (ref.current) {
+            ref.current.srcObject = stream;
+        }
+    });
+  }, [peer]);
+
+  return <audio ref={ref} autoPlay />;
+};

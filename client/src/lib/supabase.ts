@@ -11,6 +11,7 @@ export interface Room {
   host_id: string;
   movie_url: string;
   movie_title: string;
+  subtitles_url?: string;
   playback_time: number;
   is_playing: boolean;
   created_at: string;

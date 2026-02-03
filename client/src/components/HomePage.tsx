@@ -30,9 +30,10 @@ export function HomePage() {
 
     try {
       await createRoom(roomName, movieUrl, movieTitle, userName);
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error('Error creating room:', err);
-      setError(err.message || 'Failed to create room. Please try again.');
+      const message = err instanceof Error ? err.message : 'Failed to create room. Please try again.';
+      setError(message);
     } finally {
       setLoading(false);
     }
